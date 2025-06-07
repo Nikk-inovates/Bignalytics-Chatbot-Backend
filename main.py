@@ -9,6 +9,7 @@ import os
 import shutil
 import logging
 import re
+import textwrap
 
 from src.load_pdf import load_pdf_text
 from src.embed_text import split_text, embed_chunks, save_faiss_index, load_faiss_index
@@ -29,7 +30,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://chatbot-frontend-seven-lilac.vercel.app",
+        "http://localhost:8080",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -39,8 +40,12 @@ app.add_middleware(
 PDF_DIR = "data"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 LLM_MODEL_NAME = "deepseek/deepseek-chat-v3-0324:free"
+FAISS_INDEX_PATH = "embeddings/faiss_index.faiss"  # Adjust path as per your save_faiss_index implementation
+CHUNKS_SAVE_PATH = "embeddings/chunks.pkl"        # If you save chunks separately; adjust accordingly
+PDF_PATH = os.path.join(PDF_DIR, "knowledge.pdf")
 
 os.makedirs(PDF_DIR, exist_ok=True)
+os.makedirs("embeddings", exist_ok=True)  # Ensure embeddings folder exists
 
 embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
@@ -74,6 +79,58 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
+
+
+def format_bullet_hanging_indent(text: str, max_width=70) -> str:
+    """
+    Format bullets so multiline bullet points align properly with hanging indent.
+    Uses textwrap to ensure wrapped lines start under the text, not the bullet.
+    """
+    lines = []
+    for paragraph in text.split('\n'):
+        # Only process bullet points that start with "• "
+        if paragraph.startswith("• "):
+            bullet = "• "
+            indent = " " * (len(bullet)+1)
+            formatted = textwrap.fill(
+                paragraph[len(bullet):],  # Remove bullet for wrapping
+                width=max_width,
+                initial_indent=bullet,
+                subsequent_indent=indent
+            )
+            lines.append(formatted)
+        else:
+            lines.append(paragraph)
+    return "\n".join(lines)
+
+
+@app.on_event("startup")
+def startup_event():
+    try:
+        # Check if FAISS index file exists, else create it from local PDF
+        if not os.path.exists(FAISS_INDEX_PATH):
+            logger.info("FAISS index not found. Creating index from local PDF...")
+
+            # Load PDF text
+            text = load_pdf_text(PDF_PATH)
+            logger.info(f"Loaded PDF with {len(text)} characters")
+
+            # Split text into chunks
+            chunks = split_text(text)
+            logger.info(f"Split text into {len(chunks)} chunks")
+
+            # Embed chunks and build FAISS index
+            model, index, embeddings, chunk_list = embed_chunks(chunks, EMBEDDING_MODEL_NAME)
+
+            # Save FAISS index and chunk list
+            save_faiss_index(index, chunk_list)
+            logger.info("FAISS index and chunks saved successfully.")
+
+        else:
+            logger.info("FAISS index found. Skipping creation on startup.")
+
+    except Exception as e:
+        logger.error(f"Failed to create FAISS index on startup: {e}")
 
 
 @app.get("/")
@@ -117,6 +174,7 @@ async def ask_question_api(question: str = Form(...)):
             "Use normal sentence case (capitalize only the first letter of each sentence and proper nouns). "
             "Use proper punctuation and spacing. "
             "Format lists with bullet points (•) followed by a tab or space. "
+            "If a bullet point wraps onto more than one line, indent all lines after the first so that they align with the start of the text, not the bullet (hanging indent). "
             "Use section headings in plain sentence case without markdown, surrounded by blank lines. "
             "Avoid markdown syntax, emojis, filler, informal language, or feedback phrases. "
             "Make the response look like well-structured business or marketing copy — polished, clear, and easy to read."
@@ -128,6 +186,9 @@ async def ask_question_api(question: str = Form(...)):
         raw_response = ask_llm_question(LLM_MODEL_NAME, top_chunks, full_prompt)
 
         clean_response = clean_text(raw_response)
+
+        # Hanging indent formatting added here:
+        clean_response = format_bullet_hanging_indent(clean_response)
 
         log_chat_to_history(question, clean_response)
 
